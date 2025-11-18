@@ -1,363 +1,374 @@
-# This is an adapted version of https://github.com/AutomatedProcessImprovement/Simod/blob/2f3b7391f9e49e248927d61e07ec9e26d16d77e7/src/simod_http/main.py
-# orginally created by Ihar Suvorau
-# It adds cors clearance to make the api usable with other tools
+# HTTP wrapper for Simod 5.1.6
+# This is adapted to work with SimuBridge while using Simod 5.1.6
 
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
-from typing import Union, Optional
+from typing import Optional
+from uuid import uuid4
 
 import pandas as pd
 import uvicorn
-from fastapi import FastAPI, BackgroundTasks, Request, Response, Form
-from fastapi.responses import JSONResponse
-from fastapi_utils.tasks import repeat_every
-### <Added import> 
+from fastapi import FastAPI, BackgroundTasks, Form, UploadFile
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-### </Added import>
-from uvicorn.config import LOGGING_CONFIG
+from pydantic import BaseModel
+from enum import Enum
 
-from simod.configuration import Configuration
-from simod.event_log.utilities import read as read_event_log
-from simod_http.app import Response as AppResponse, RequestStatus, Request as AppRequest, Settings, NotFound, \
-    UnsupportedMediaType, BaseRequestException, NotificationSettings, NotificationMethod, \
-    NotSupported
-from simod_http.archiver import make_url_for
-from simod_http.executor import Executor
 
-debug = os.environ.get('SIMOD_HTTP_DEBUG', 'false').lower() == 'true'
+# Configuration
+DEBUG = os.environ.get('SIMOD_HTTP_DEBUG', 'false').lower() == 'true'
+STORAGE_PATH = Path(os.environ.get('SIMOD_HTTP_STORAGE_PATH', '/tmp/simod'))
+STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 
-if debug:
-    settings = Settings()
-else:
-    settings = Settings(_env_file='.env.production')
+# FastAPI app
+app = FastAPI(title="Simod HTTP API for Simod 5.1.6")
 
-settings.simod_http_storage_path = Path(settings.simod_http_storage_path)
-
-app = FastAPI()
-
-### <Added Cors> 
-origins = ["*"]
-
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-### </Added import> 
 
 
-# Background tasks
+# Models
+class RequestStatus(str, Enum):
+    UNKNOWN = "unknown"
+    ACCEPTED = "accepted"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILURE = "failure"
 
-def run_simod_discovery(request: Request, settings: Settings):
-    """
-    Run Simod with the user's configuration.
-    """
-    executor = Executor(app_settings=settings, request=request)
-    executor.run()
+
+class DiscoveryRequest(BaseModel):
+    id: str
+    status: RequestStatus
+    timestamp: Optional[pd.Timestamp] = None
+    output_dir: Optional[Path] = None
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
-# Hooks
+class DiscoveryResponse(BaseModel):
+    request_id: str
+    request_status: RequestStatus
+    archive_url: Optional[str] = None
 
-@app.on_event('startup')
-async def application_startup():
-    logging_handlers = []
-    if settings.simod_http_log_path is not None:
-        logging_handlers.append(logging.FileHandler(settings.simod_http_log_path, mode='w'))
 
-    if len(logging_handlers) > 0:
-        logging.basicConfig(
-            level=settings.simod_http_logging_level.upper(),
-            handlers=logging_handlers,
-            format=settings.simod_http_logging_format,
+# Request storage (simple file-based for backward compatibility)
+def save_request(request: DiscoveryRequest):
+    """Save request metadata to disk"""
+    request_dir = STORAGE_PATH / 'requests' / request.id
+    request_dir.mkdir(parents=True, exist_ok=True)
+    
+    import json
+    with open(request_dir / 'request.json', 'w') as f:
+        json.dump({
+            'id': request.id,
+            'status': request.status.value,
+            'timestamp': request.timestamp.isoformat() if request.timestamp else None,
+            'output_dir': str(request.output_dir) if request.output_dir else None
+        }, f)
+
+
+def load_request(request_id: str) -> DiscoveryRequest:
+    """Load request metadata from disk"""
+    import json
+    request_dir = STORAGE_PATH / 'requests' / request_id
+    
+    if not request_dir.exists():
+        raise FileNotFoundError(f"Request {request_id} not found")
+    
+    with open(request_dir / 'request.json', 'r') as f:
+        data = json.load(f)
+    
+    return DiscoveryRequest(
+        id=data['id'],
+        status=RequestStatus(data['status']),
+        timestamp=pd.Timestamp(data['timestamp']) if data['timestamp'] else None,
+        output_dir=Path(data['output_dir']) if data['output_dir'] else None
+    )
+
+
+# Background task to run Simod discovery
+def run_simod_discovery(request_id: str, event_log_path: Path, configuration_path: Optional[Path]):
+    """Run Simod discovery in background"""
+    try:
+        request = load_request(request_id)
+        request.status = RequestStatus.RUNNING
+        request.timestamp = pd.Timestamp.now()
+        save_request(request)
+        
+        output_dir = STORAGE_PATH / 'requests' / request_id / 'output'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Build Simod command - use poetry run to access Simod in its virtual environment
+        cmd = ['bash', '-c', f'cd /usr/src/Simod && poetry run simod']
+        
+        # Add event log parameter  
+        if configuration_path:
+            cmd = ['bash', '-c', f'cd /usr/src/Simod && poetry run simod --configuration {configuration_path} --output {output_dir}']
+        else:
+            cmd = ['bash', '-c', f'cd /usr/src/Simod && poetry run simod --one-shot --event-log {event_log_path} --output {output_dir}']
+        
+        logging.info(f"Running Simod command: {' '.join(cmd)}")
+        
+        # Run Simod
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
         )
-    else:
-        logging.basicConfig(
-            level=settings.simod_http_logging_level.upper(),
-            format=settings.simod_http_logging_format,
-        )
-
-    logging.debug(f'Application settings: {settings}')
-
-
-@app.on_event('shutdown')
-async def application_shutdown():
-    requests_dir = Path(settings.simod_http_storage_path) / 'requests'
-
-    if not requests_dir.exists():
-        return
-
-    for request_dir in requests_dir.iterdir():
-        logging.info(f'Checking request directory before shutting down: {request_dir}')
-
-        await _remove_empty_or_orphaned_request_dir(request_dir)
-
+        
+        logging.info(f"Simod stdout: {result.stdout}")
+        if result.stderr:
+            logging.error(f"Simod stderr: {result.stderr}")
+        
+        # Update request status based on result
+        request = load_request(request_id)
+        if result.returncode == 0:
+            request.status = RequestStatus.SUCCESS
+            request.output_dir = output_dir
+        else:
+            request.status = RequestStatus.FAILURE
+            logging.error(f"Simod failed with return code {result.returncode}")
+        
+        request.timestamp = pd.Timestamp.now()
+        save_request(request)
+        
+    except Exception as e:
+        logging.error(f"Error running Simod discovery: {e}", exc_info=True)
         try:
-            request = AppRequest.load(request_dir.name, settings)
-        except Exception as e:
-            logging.error(f'Failed to load request: {request_dir.name}, {str(e)}')
-            continue
-
-        # At the end, there are only 'failed' or 'succeeded' requests
-        if request.status not in [RequestStatus.SUCCESS, RequestStatus.FAILURE]:
+            request = load_request(request_id)
             request.status = RequestStatus.FAILURE
             request.timestamp = pd.Timestamp.now()
-            request.save()
-
-
-@app.on_event('startup')
-@repeat_every(seconds=settings.simod_http_storage_cleaning_timedelta)
-async def clean_up():
-    requests_dir = Path(settings.simod_http_storage_path) / 'requests'
-
-    if not requests_dir.exists():
-        return
-
-    current_timestamp = pd.Timestamp.now()
-    expire_after_delta = pd.Timedelta(seconds=settings.simod_http_request_expiration_timedelta)
-
-    for request_dir in requests_dir.iterdir():
-        if request_dir.is_dir():
-            logging.info(f'Checking request directory for expired data: {request_dir}')
-
-            await _remove_empty_or_orphaned_request_dir(request_dir)
-
-            try:
-                request = AppRequest.load(request_dir.name, settings)
-            except Exception as e:
-                logging.error(f'Failed to load request: {request_dir.name}, {str(e)}')
-                continue
-
-            # Removes expired requests
-            expired_at = request.timestamp + expire_after_delta
-            if expired_at <= current_timestamp:
-                logging.info(f'Removing request folder for {request_dir.name}, expired at {expired_at}')
-                shutil.rmtree(request_dir, ignore_errors=True)
-
-            # Removes requests without timestamp that are not running
-            if request.timestamp is None and request.status != RequestStatus.RUNNING:
-                logging.info(f'Removing request folder for {request_dir.name}, no timestamp and not running')
-                shutil.rmtree(request_dir, ignore_errors=True)
-
-
-async def _remove_empty_or_orphaned_request_dir(request_dir):
-    # Removes empty directories
-    if len(list(request_dir.iterdir())) == 0:
-        logging.info(f'Removing empty directory: {request_dir}')
-        shutil.rmtree(request_dir, ignore_errors=True)
-
-    # Removes orphaned request directories
-    if not (request_dir / 'request.json').exists():
-        logging.info(f'Removing request folder for {request_dir.name}, no request.json file')
-        shutil.rmtree(request_dir, ignore_errors=True)
-
-
-@app.exception_handler(BaseRequestException)
-async def request_exception_handler(_, exc: BaseRequestException) -> JSONResponse:
-    logging.error(f'Request exception occurred: {exc}')
-    return exc.json_response()
+            save_request(request)
+        except Exception as save_error:
+            logging.error(f"Error saving failure status: {save_error}")
 
 
 # Routes
+@app.post('/discoveries')
+async def create_discovery(
+    background_tasks: BackgroundTasks,
+    event_log: UploadFile,
+    configuration: Optional[UploadFile] = None,
+    callback_url: Optional[str] = None,
+) -> JSONResponse:
+    """
+    Create a new business process model discovery request.
+    """
+    # Create new request
+    request_id = str(uuid4())
+    request = DiscoveryRequest(
+        id=request_id,
+        status=RequestStatus.ACCEPTED
+    )
+    
+    request_dir = STORAGE_PATH / 'requests' / request_id
+    request_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save event log
+    event_log_extension = _infer_event_log_extension(event_log.content_type, event_log.filename)
+    event_log_path = request_dir / f'event_log{event_log_extension}'
+    
+    with open(event_log_path, 'wb') as f:
+        content = await event_log.read()
+        f.write(content)
+    
+    # Save configuration if provided
+    configuration_path = None
+    if configuration:
+        config_extension = '.yaml' if 'yaml' in configuration.content_type.lower() else '.json'
+        configuration_path = request_dir / f'configuration{config_extension}'
+        
+        with open(configuration_path, 'wb') as f:
+            content = await configuration.read()
+            f.write(content)
+    
+    # Save request metadata
+    save_request(request)
+    
+    # Start background task
+    background_tasks.add_task(
+        run_simod_discovery,
+        request_id,
+        event_log_path,
+        configuration_path
+    )
+    
+    response = DiscoveryResponse(
+        request_id=request_id,
+        request_status=request.status
+    )
+    
+    return JSONResponse(
+        status_code=202,
+        content=response.model_dump()
+    )
+
+
+@app.get('/discoveries/{request_id}')
+async def read_discovery(request_id: str) -> DiscoveryResponse:
+    """
+    Get the status of a discovery request.
+    """
+    try:
+        request = load_request(request_id)
+        
+        # Build archive URL if successful
+        archive_url = None
+        if request.status == RequestStatus.SUCCESS and request.output_dir:
+            # Look for result files
+            best_result_dir = request.output_dir / 'best_result'
+            if best_result_dir.exists():
+                # Create a simple list of available files
+                archive_url = f"/discoveries/{request_id}/results.tar.gz"
+        
+        return DiscoveryResponse(
+            request_id=request_id,
+            request_status=request.status,
+            archive_url=archive_url
+        )
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "request_id": request_id,
+                "request_status": RequestStatus.UNKNOWN.value,
+                "message": "Request not found"
+            }
+        )
+
 
 @app.get('/discoveries/{request_id}/{file_name}')
 async def read_discovery_file(request_id: str, file_name: str):
     """
     Get a file from a discovery request.
     """
-    request = AppRequest.load(request_id, settings)
-
-    if not request.output_dir.exists():
-        raise NotFound(request_id=request_id, request_status=request.status, message='Request not found on the server')
-
-    file_path = request.output_dir / file_name
-    if not file_path.exists():
-        raise NotFound(request_id=request_id, request_status=request.status, message=f'File not found: {file_name}')
-
-    media_type = await _infer_media_type_from_extension(file_name)
-
-    return Response(
-        content=file_path.read_bytes(),
-        media_type=media_type,
-        headers={
-            'Content-Disposition': f'attachment; filename="{file_name}"',
-        }
-    )
-
-
-@app.get('/discoveries/{request_id}')
-async def read_discovery(request_id: str) -> AppResponse:
-    """
-    Get the status of the request.
-    """
-    request = AppRequest.load(request_id, settings)
-
-    return AppResponse(
-        request_id=request_id,
-        request_status=request.status,
-        archive_url=make_url_for(request.id, Path(f'{request.id}.tar.gz'),
-                                 settings) if request.status == RequestStatus.SUCCESS else None,
-    )
-
-
-@app.post('/discoveries')
-async def create_discovery(
-        background_tasks: BackgroundTasks,
-        configuration=Form(),
-        event_log=Form(),
-        callback_url: Optional[str] = None,
-        email: Optional[str] = None,
-) -> JSONResponse:
-    """
-    Create a new business process model discovery and optimization request.
-    """
-    global settings
-
-    request = await _empty_request_from_params(settings.simod_http_storage_path, callback_url, email)
-
-    if email is not None:
-        request.status = RequestStatus.FAILURE
-        request.save()
-
-        raise NotSupported(
-            request_id=request.id,
-            request_status=request.status,
-            message='Email notifications are not supported',
+    try:
+        request = load_request(request_id)
+        
+        if not request.output_dir or not request.output_dir.exists():
+            return JSONResponse(
+                status_code=404,
+                content={"message": "Output not found"}
+            )
+        
+        # Handle archive request
+        if file_name == 'results.tar.gz':
+            best_result_dir = request.output_dir / 'best_result'
+            if not best_result_dir.exists():
+                return JSONResponse(
+                    status_code=404,
+                    content={"message": "Results not found"}
+                )
+            
+            # Create tar.gz archive
+            archive_path = request.output_dir / 'results'
+            shutil.make_archive(str(archive_path), 'gztar', best_result_dir)
+            
+            with open(f"{archive_path}.tar.gz", 'rb') as f:
+                content = f.read()
+            
+            return Response(
+                content=content,
+                media_type='application/gzip',
+                headers={
+                    'Content-Disposition': f'attachment; filename="results.tar.gz"'
+                }
+            )
+        
+        # Handle individual file request
+        file_path = request.output_dir / 'best_result' / file_name
+        if not file_path.exists():
+            # Try without best_result subdirectory
+            file_path = request.output_dir / file_name
+            if not file_path.exists():
+                return JSONResponse(
+                    status_code=404,
+                    content={"message": f"File not found: {file_name}"}
+                )
+        
+        media_type = _infer_media_type(file_name)
+        
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                'Content-Disposition': f'attachment; filename="{file_name}"'
+            }
+        )
+    
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={"message": "Request not found"}
         )
 
-    # Configuration
 
-    configuration = Configuration.from_stream(configuration.file)
-
-    # Event log
-
-    event_log_file_extension = _infer_event_log_file_extension_from_header(event_log.content_type)
-    if event_log_file_extension is None:
-        raise UnsupportedMediaType(
-            request_id=request.id,
-            request_status=request.status,
-            archive_url=None,
-            message='Unsupported event log file type',
-        )
-
-    event_log_path = request.output_dir / f'event_log{event_log_file_extension}'
-    event_log_path.write_bytes(event_log.file.read())
-
-    configuration.common.log_path = event_log_path.absolute()
-    configuration.common.test_log_path = None
-
-    event_log, event_log_csv_path = read_event_log(configuration.common.log_path, configuration.common.log_ids)
-
-    request.configuration = configuration
-    request.event_log = event_log
-    request.event_log_csv_path = event_log_csv_path
-    request.status = RequestStatus.ACCEPTED
-    request.save()
-
-    # Response
-
-    response = AppResponse(request_id=request.id, request_status=request.status)
-
-    background_tasks.add_task(run_simod_discovery, request, settings)
-
-    return response.json_response(status_code=202)
-
-
-@app.get('/{any_str}')
-async def root() -> JSONResponse:
-    raise NotFound(
-        request_id='N/A',
-        request_status=RequestStatus.UNKNOWN,
-        message='Not found',
-    )
-
-
-# Helpers
-
-async def _empty_request_from_params(
-        storage_path: str,
-        callback_url: Optional[str] = None,
-        email: Optional[str] = None
-) -> AppRequest:
-    request = AppRequest.empty(Path(storage_path))
-
-    if callback_url is not None:
-        notification_settings = NotificationSettings(
-            method=NotificationMethod.HTTP,
-            callback_url=callback_url,
-        )
-    elif email is not None:
-        notification_settings = NotificationSettings(
-            method=NotificationMethod.EMAIL,
-            email=email,
-        )
-    else:
-        notification_settings = None
-
-    request.notification_settings = notification_settings
-
-    return request
-
-
-def _infer_event_log_file_extension_from_header(
-        content_type: str,
-) -> Union[str, None]:
-    if 'text/csv' in content_type:
+# Helper functions
+def _infer_event_log_extension(content_type: str, filename: str) -> str:
+    """Infer file extension from content type or filename"""
+    if 'csv' in content_type.lower() or (filename and filename.endswith('.csv')):
         return '.csv'
-    elif 'application/xml' in content_type or 'text/xml' in content_type:
+    elif 'xml' in content_type.lower() or (filename and filename.endswith('.xes')):
+        return '.xes'
+    elif filename and filename.endswith('.xml'):
         return '.xml'
     else:
-        return None
+        return '.csv'  # Default
 
 
-async def _infer_media_type_from_extension(file_name) -> str:
+def _infer_media_type(file_name: str) -> str:
+    """Infer media type from file extension"""
     if file_name.endswith('.csv'):
-        media_type = 'text/csv'
-    elif file_name.endswith('.xml'):
-        media_type = 'application/xml'
-    elif file_name.endswith('.xes'):
-        media_type = 'application/xml'
-    elif file_name.endswith('.bpmn'):
-        media_type = 'application/xml'
+        return 'text/csv'
+    elif file_name.endswith('.xml') or file_name.endswith('.xes') or file_name.endswith('.bpmn'):
+        return 'application/xml'
     elif file_name.endswith('.json'):
-        media_type = 'application/json'
+        return 'application/json'
     elif file_name.endswith('.png'):
-        media_type = 'image/png'
+        return 'image/png'
     elif file_name.endswith('.jpg') or file_name.endswith('.jpeg'):
-        media_type = 'image/jpeg'
+        return 'image/jpeg'
     elif file_name.endswith('.pdf'):
-        media_type = 'application/pdf'
+        return 'application/pdf'
     elif file_name.endswith('.txt'):
-        media_type = 'text/plain'
-    elif file_name.endswith('.zip'):
-        media_type = 'application/zip'
+        return 'text/plain'
     elif file_name.endswith('.gz'):
-        media_type = 'application/gzip'
+        return 'application/gzip'
     elif file_name.endswith('.tar'):
-        media_type = 'application/tar'
-    elif file_name.endswith('.tar.gz'):
-        media_type = 'application/tar+gzip'
-    elif file_name.endswith('.tar.bz2'):
-        media_type = 'application/x-bzip2'
+        return 'application/tar'
     else:
-        media_type = 'application/octet-stream'
+        return 'application/octet-stream'
 
-    return media_type
+
+# Startup logging
+@app.on_event('startup')
+async def startup():
+    logging.basicConfig(
+        level=logging.DEBUG if DEBUG else logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logging.info("Starting Simod HTTP API for Simod 5.1.6")
+    logging.info(f"Storage path: {STORAGE_PATH}")
 
 
 if __name__ == '__main__':
-    logging_config = LOGGING_CONFIG
-    logging_config['formatters']['default']['fmt'] = settings.simod_http_logging_format
-    logging_config['formatters']['access']['fmt'] = settings.simod_http_logging_format.replace(
-        '%(message)s', '%(client_addr)s - "%(request_line)s" %(status_code)s')
-
     uvicorn.run(
-        'main:app',
-        host=settings.simod_http_host,
-        port=settings.simod_http_port,
-        log_level='info',
-        log_config=logging_config,
+        'main_v2:app',
+        host='0.0.0.0',
+        port=80,
+        log_level='info' if not DEBUG else 'debug',
     )
