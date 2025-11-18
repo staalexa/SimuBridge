@@ -20,7 +20,7 @@ RUN mkdir -p /tmp/simod
 
 # Copy the HTTP wrapper
 WORKDIR /app
-COPY main_v2.py /app/main.py
+COPY main.py /app/main.py
 
 # Expose port
 EXPOSE 80
