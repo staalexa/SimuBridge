@@ -175,9 +175,9 @@ async def create_discovery(
     request_dir = STORAGE_PATH / 'requests' / request_id
     request_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save event log
-    event_log_extension = _infer_event_log_extension(event_log.content_type, event_log.filename)
-    event_log_path = request_dir / f'event_log{event_log_extension}'
+    # Save event log with its original filename (Simod config references this name)
+    event_log_filename = event_log.filename if event_log.filename else 'event_log.csv'
+    event_log_path = request_dir / event_log_filename
     
     with open(event_log_path, 'wb') as f:
         content = await event_log.read()
